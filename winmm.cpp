@@ -192,7 +192,6 @@ extern "C"
 	FARPROC OrignalwaveOutUnprepareHeader;
 	FARPROC OrignalwaveOutWrite;
 }
-ANYFUNCTIONCALL org_function;
 FILE* fpOut = NULL;
 FILE* fpErr = NULL;
 FILE* fpIn = NULL;
@@ -245,118 +244,48 @@ static const char* KEY_AOB =
 	"48 8B 05 ?? ?? ?? ?? 48 8B 80 B8 00 00 00 48 8B 50 20";
 #define KEY_HOOK_OFFSET 0x0F   // "mov rbx,rax": at entry RAX = hex key string (IL2CPP String)
 
-extern "C" {
-	uint64_t keyCapturedRax = 0;   // written by keyHookStub (common.asm)
-	uint64_t gKeyTrampoline = 0;   // trampoline address, written after hook install
-	uint64_t gSavedRsp = 0;        // saved RSP across the C handler call (r10 is caller-saved)
-	void keyHookStub();            // common.asm
-}
+#include "mhook_mid.h"
 
-// IL2CPP String: length(int32) at +0x10, UTF-16LE chars at +0x14
-extern "C" void keyLogHandler() {
-	printf("[KeyHook] hook fired, RAX=%p\n", (void*)keyCapturedRax);
+// Plain C handler. The framework-built stub saved all GPRs into ctx before
+// calling us; ctx->Rax is the IL2CPP String at the hook point (mov rbx,rax
+// has not yet executed, RAX still holds the hex key string).
+extern "C" void keyHandler(MF_CONTEXT* ctx) {
+	printf("[KeyHook] hook fired, RAX=%p\n", (void*)ctx->Rax);
+	MessageBoxA(NULL, "L", "LOG", MB_OK);
 	fflush(stdout);
 	__try {
-		uint8_t* s = (uint8_t*)keyCapturedRax;
-		int32_t len = *(int32_t*)(s + 0x10);
+		uint8_t* s = (uint8_t*)ctx->Rax;
+		int32_t len = *(int32_t*)(s + 0x10);          // IL2CPP String: length at +0x10
 		if (len <= 0 || len > 256) return;
 		wchar_t buf[257];
-		memcpy(buf, s + 0x14, (size_t)len * 2);
+		memcpy(buf, s + 0x14, (size_t)len * 2);       // UTF-16LE chars at +0x14
 		buf[len] = 0;
 		printf("[KeyHook] PRAGMA key = \"x'%ls'\";\n", buf);
 		fflush(stdout);
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {
-		printf("[KeyHook] exception reading string at %p\n", (void*)keyCapturedRax);
+		printf("[KeyHook] exception reading string at %p\n", (void*)ctx->Rax);
 	}
+	MessageBoxA(NULL, "OVER", "OVER", MB_OK);
 }
 
-// Custom mid-function hook. AutoHookHelper's trampoline re-assembles capstone
-// text with keystone, which mangles rip-relative operands (capstone prints the
-// absolute target, keystone treats the number as a displacement). We relocate
-// instructions by hand instead.
-//
-// Stolen instructions at hook point (AOB+0x0F, offsets relative to hook):
-//   +0x00  48 89 C3              mov rbx, rax
-//   +0x03  48 8B 05 xx xx xx xx  mov rax, [rip+disp32]   <- needs disp fixup
-//   +0x0A  48 8B 80 B8 00 00 00  mov rax, [rax+0xB8]
-//   total 17 bytes; patch is 12 bytes (movabs r11,stub / push r11 / ret) + 5 NOPs
 static bool InstallKeyHook(uint8_t* hookAddr) {
-	// sanity check stolen bytes (skip the 4 wildcard disp32 bytes):
-	// +0x00: 48 89 C3          mov rbx, rax
-	// +0x03: 48 8B 05          mov rax, [rip+disp32]
-	// +0x0A: 48 8B 80 B8 0000  mov rax, [rax+0xB8]
-	static const uint8_t exp1[] = { 0x48,0x89,0xC3, 0x48,0x8B,0x05 };
-	static const uint8_t exp2[] = { 0x48,0x8B,0x80,0xB8,0x00,0x00,0x00 };
-	if (memcmp(hookAddr, exp1, sizeof(exp1)) != 0 ||
-		memcmp(hookAddr + 10, exp2, sizeof(exp2)) != 0) {
-		printf("[KeyHook] unexpected bytes at hook point, aborting\n");
+	if (MF_Initialize() != MH_OK) {
+		printf("[KeyHook] MF_Initialize failed\n");
 		return false;
 	}
-	// original rip-relative target (absolute)
-	int32_t disp = *(int32_t*)(hookAddr + 6);
-	uint64_t absTarget = (uint64_t)(hookAddr + 3) + 7 + (int64_t)disp;
-
-	// Allocate a page NEAR GameAssembly (within 2GB) so rel32 addressing stays valid.
-	// Layout: [relay: jmp [rip+0] -> stub][trampoline: stolen insns -> jmp back]
-	uint64_t base = (uint64_t)hookAddr & ~0xFFFFULL;
-	uint8_t* page = NULL;
-	for (int i = 1; i <= 8192 && !page; ++i) {
-		uint64_t hint = base - (uint64_t)i * 0x10000;   // walk downwards in 64K steps
-		page = (uint8_t*)VirtualAlloc((LPVOID)hint, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-	}
-	if (!page) {
-		printf("[KeyHook] failed to allocate relay page near GameAssembly\n");
+	void* trampoline = NULL;
+	MH_STATUS s = MF_CreateHookMidFunc(hookAddr, keyHandler, &trampoline);
+	if (s != MH_OK) {
+		printf("[KeyHook] MF_CreateHookMidFunc failed: %s\n", MH_StatusToString(s));
 		return false;
 	}
-	printf("[KeyHook] relay page at %p (delta %+lld MB from hook)\n",
-		(void*)page, ((int64_t)page - (int64_t)hookAddr) >> 20);
-
-	// relay: jmp [rip+0] -> keyHookStub (absolute, register-free)
-	uint8_t* relay = page;
-	size_t n = 0;
-	relay[n++] = 0xFF; relay[n++] = 0x25; relay[n++] = 0; relay[n++] = 0; relay[n++] = 0; relay[n++] = 0;
-	uint64_t stub = (uint64_t)&keyHookStub;
-	memcpy(relay + n, &stub, 8); n += 8;
-
-	// trampoline: only the 2 stolen instructions (mov rbx,rax + mov rax,[rip+disp32]),
-	// then jmp [rip+0] back to hookAddr+10. (mov rax,[rax+0xB8] at hookAddr+10 is
-	// original code, NOT stolen — must not be re-executed here.)
-	uint8_t* tramp = page + 32;
-	size_t t = 0;
-	memcpy(tramp + t, hookAddr, 3); t += 3;                        // mov rbx, rax
-	tramp[t++] = 0x48; tramp[t++] = 0x8B; tramp[t++] = 0x05;       // mov rax, [rip+newdisp]
-	int64_t delta = (int64_t)absTarget - (int64_t)(tramp + t + 4);
-	if (delta > INT32_MAX || delta < INT32_MIN) {
-		printf("[KeyHook] trampoline disp32 out of range (%lld)\n", delta);
+	s = MF_EnableHook(hookAddr);
+	if (s != MH_OK) {
+		printf("[KeyHook] MF_EnableHook failed: %s\n", MH_StatusToString(s));
 		return false;
 	}
-	int32_t newDisp = (int32_t)delta;
-	memcpy(tramp + t, &newDisp, 4); t += 4;
-	tramp[t++] = 0xFF; tramp[t++] = 0x25; tramp[t++] = 0; tramp[t++] = 0; tramp[t++] = 0; tramp[t++] = 0;
-	uint64_t back = (uint64_t)(hookAddr + 10);
-	memcpy(tramp + t, &back, 8); t += 8;
-	FlushInstructionCache(GetCurrentProcess(), page, 0x1000);
-	gKeyTrampoline = (uint64_t)tramp;
-
-	// patch at hookAddr: E9 rel32 -> relay (5 bytes, register-free, stack-neutral)
-	// stolen region is only 10 bytes (mov rbx,rax + mov rax,[rip]) -> 5 NOPs
-	uint8_t patch[10];
-	int64_t rel = (int64_t)((uint64_t)relay) - (int64_t)(hookAddr + 5);
-	if (rel > INT32_MAX || rel < INT32_MIN) {
-		printf("[KeyHook] patch rel32 out of range (%lld)\n", rel);
-		return false;
-	}
-	patch[0] = 0xE9;
-	int32_t rel32 = (int32_t)rel;
-	memcpy(patch + 1, &rel32, 4);
-	memset(patch + 5, 0x90, 5);
-
-	DWORD oldProt;
-	if (!VirtualProtect(hookAddr, sizeof(patch), PAGE_EXECUTE_READWRITE, &oldProt)) return false;
-	memcpy(hookAddr, patch, sizeof(patch));
-	FlushInstructionCache(GetCurrentProcess(), hookAddr, sizeof(patch));
-	VirtualProtect(hookAddr, sizeof(patch), oldProt, &oldProt);
+	printf("[KeyHook] hook installed, trampoline=%p\n", trampoline);
 	return true;
 }
 
@@ -651,6 +580,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 	}
 	case DLL_PROCESS_DETACH:
 	{
+		MF_Uninitialize();
 		FreeLibrary(hOrigDll);
 	}
 	break;

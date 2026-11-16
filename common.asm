@@ -903,42 +903,4 @@ FakewaveOutWrite proc
 	jmp qword ptr [OrignalwaveOutWrite]
 FakewaveOutWrite endp
 
-; ---- Game key hook stub ----
-; Hooked at AOB+0x0F, i.e. right before "mov rbx,rax": at entry RAX = IL2CPP
-; String holding the 64-char hex key. The patch enters via movabs r11/push r11/ret
-; so RAX is intact. We save RAX for the handler, keep a copy for the trampoline
-; (its first stolen instruction "mov rbx,rax" needs RAX as input), call the C
-; handler on an aligned stack, restore RAX and tail-jump to the trampoline
-; which re-executes the stolen instructions and jumps back into GameAssembly.
-extern keyCapturedRax:qword
-extern gKeyTrampoline:qword
-extern gSavedRsp:qword
-extern keyLogHandler:proc
-
-keyHookStub proc
-	mov keyCapturedRax, rax
-	mov gSavedRsp, rsp          ; stash RSP in a global (any register holder would be
-	                            ; caller-saved and clobbered by the C handler)
-	push rax
-	push rcx
-	push rdx
-	push r8
-	push r9
-	push r10
-	push r11
-	sub rsp, 28h                ; shadow space (32) + 8 to keep 16-byte alignment
-	                            ; (8 pushes = 64 bytes already aligned, +8 misaligns, +8 realigns)
-	call keyLogHandler
-	add rsp, 28h
-	pop r11
-	pop r10
-	pop r9
-	pop r8
-	pop rdx
-	pop rcx
-	pop rax
-	mov rsp, gSavedRsp          ; belt-and-suspenders: restore RSP from stash too
-	jmp qword ptr [gKeyTrampoline]
-keyHookStub endp
-
 end
