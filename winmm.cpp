@@ -1,5 +1,11 @@
 #include <windows.h>
-
+#include <stdio.h>
+#include <windows.h>
+#include <cstdint>
+#include <vector>
+#include <string>
+#include <array>
+typedef ULONG_PTR(WINAPI* ANYFUNCTIONCALL)(...);
 // MSVC has no __asm inline assembly on x64, so the Fake* thunks are MASM stubs in winmm.asm.
 // Plain extern "C" globals so the asm file can reference them by symbol name.
 extern "C"
@@ -186,6 +192,269 @@ extern "C"
 	FARPROC OrignalwaveOutUnprepareHeader;
 	FARPROC OrignalwaveOutWrite;
 }
+ANYFUNCTIONCALL org_function;
+FILE* fpOut = NULL;
+FILE* fpErr = NULL;
+FILE* fpIn = NULL;
+void InitConsoleWindow(BOOL switch_on)
+{
+
+	const HWND consoleWindow = GetConsoleWindow();
+	BOOL no_handle = consoleWindow == NULL;
+	if (switch_on && no_handle)
+	{
+		int hCrt;
+		FILE* hf;
+
+		AllocConsole();
+		if (fpIn != NULL) fclose(fpIn);
+		if (fpOut != NULL) fclose(fpOut);
+		if (fpErr != NULL) fclose(fpErr);
+		fpIn = freopen("conin$", "r", stdin);
+		fpOut = freopen("conout$", "w", stdout);
+		fpErr = freopen("conout$", "w", stderr);
+		// test code
+		printf("InitConsoleWindow OK!\n");
+	}
+	else if (!switch_on && !no_handle) {
+		printf("Closing Console Window...\n");
+		fflush(stdout);
+		fflush(stderr);
+		fflush(stdin);
+		// Close the file streams if they were redirected
+
+		FreeConsole();
+		if (fpIn != NULL) fclose(fpIn);
+		if (fpOut != NULL) fclose(fpOut);
+		if (fpErr != NULL) fclose(fpErr);
+
+		// Redirect stdout and stderr back to NUL to avoid invalid pointer issues
+		fpIn = freopen("NUL:", "r", stdin);
+		fpOut = freopen("NUL:", "w", stdout);
+		fpErr = freopen("NUL:", "w", stderr);
+
+	}
+}
+
+
+// ===================== GameAssembly.dll key hook (AOB scan) =====================
+// Reference: 6月到8月游戏密钥hook点迁移总结.md §5
+// AOB verified unique on 2026-06 and 2026-08 builds.
+static const char* KEY_AOB =
+	"31 D2 E8 ?? ?? ?? ?? 48 89 C2 E8 ?? ?? ?? ?? 48 89 C3 "
+	"48 8B 05 ?? ?? ?? ?? 48 8B 80 B8 00 00 00 48 8B 50 20";
+#define KEY_HOOK_OFFSET 0x0F   // "mov rbx,rax": at entry RAX = hex key string (IL2CPP String)
+
+extern "C" {
+	uint64_t keyCapturedRax = 0;   // written by keyHookStub (common.asm)
+	uint64_t gKeyTrampoline = 0;   // trampoline address, written after hook install
+	uint64_t gSavedRsp = 0;        // saved RSP across the C handler call (r10 is caller-saved)
+	void keyHookStub();            // common.asm
+}
+
+// IL2CPP String: length(int32) at +0x10, UTF-16LE chars at +0x14
+extern "C" void keyLogHandler() {
+	printf("[KeyHook] hook fired, RAX=%p\n", (void*)keyCapturedRax);
+	fflush(stdout);
+	__try {
+		uint8_t* s = (uint8_t*)keyCapturedRax;
+		int32_t len = *(int32_t*)(s + 0x10);
+		if (len <= 0 || len > 256) return;
+		wchar_t buf[257];
+		memcpy(buf, s + 0x14, (size_t)len * 2);
+		buf[len] = 0;
+		printf("[KeyHook] PRAGMA key = \"x'%ls'\";\n", buf);
+		fflush(stdout);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		printf("[KeyHook] exception reading string at %p\n", (void*)keyCapturedRax);
+	}
+}
+
+// Custom mid-function hook. AutoHookHelper's trampoline re-assembles capstone
+// text with keystone, which mangles rip-relative operands (capstone prints the
+// absolute target, keystone treats the number as a displacement). We relocate
+// instructions by hand instead.
+//
+// Stolen instructions at hook point (AOB+0x0F, offsets relative to hook):
+//   +0x00  48 89 C3              mov rbx, rax
+//   +0x03  48 8B 05 xx xx xx xx  mov rax, [rip+disp32]   <- needs disp fixup
+//   +0x0A  48 8B 80 B8 00 00 00  mov rax, [rax+0xB8]
+//   total 17 bytes; patch is 12 bytes (movabs r11,stub / push r11 / ret) + 5 NOPs
+static bool InstallKeyHook(uint8_t* hookAddr) {
+	// sanity check stolen bytes (skip the 4 wildcard disp32 bytes):
+	// +0x00: 48 89 C3          mov rbx, rax
+	// +0x03: 48 8B 05          mov rax, [rip+disp32]
+	// +0x0A: 48 8B 80 B8 0000  mov rax, [rax+0xB8]
+	static const uint8_t exp1[] = { 0x48,0x89,0xC3, 0x48,0x8B,0x05 };
+	static const uint8_t exp2[] = { 0x48,0x8B,0x80,0xB8,0x00,0x00,0x00 };
+	if (memcmp(hookAddr, exp1, sizeof(exp1)) != 0 ||
+		memcmp(hookAddr + 10, exp2, sizeof(exp2)) != 0) {
+		printf("[KeyHook] unexpected bytes at hook point, aborting\n");
+		return false;
+	}
+	// original rip-relative target (absolute)
+	int32_t disp = *(int32_t*)(hookAddr + 6);
+	uint64_t absTarget = (uint64_t)(hookAddr + 3) + 7 + (int64_t)disp;
+
+	// Allocate a page NEAR GameAssembly (within 2GB) so rel32 addressing stays valid.
+	// Layout: [relay: jmp [rip+0] -> stub][trampoline: stolen insns -> jmp back]
+	uint64_t base = (uint64_t)hookAddr & ~0xFFFFULL;
+	uint8_t* page = NULL;
+	for (int i = 1; i <= 8192 && !page; ++i) {
+		uint64_t hint = base - (uint64_t)i * 0x10000;   // walk downwards in 64K steps
+		page = (uint8_t*)VirtualAlloc((LPVOID)hint, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	}
+	if (!page) {
+		printf("[KeyHook] failed to allocate relay page near GameAssembly\n");
+		return false;
+	}
+	printf("[KeyHook] relay page at %p (delta %+lld MB from hook)\n",
+		(void*)page, ((int64_t)page - (int64_t)hookAddr) >> 20);
+
+	// relay: jmp [rip+0] -> keyHookStub (absolute, register-free)
+	uint8_t* relay = page;
+	size_t n = 0;
+	relay[n++] = 0xFF; relay[n++] = 0x25; relay[n++] = 0; relay[n++] = 0; relay[n++] = 0; relay[n++] = 0;
+	uint64_t stub = (uint64_t)&keyHookStub;
+	memcpy(relay + n, &stub, 8); n += 8;
+
+	// trampoline: only the 2 stolen instructions (mov rbx,rax + mov rax,[rip+disp32]),
+	// then jmp [rip+0] back to hookAddr+10. (mov rax,[rax+0xB8] at hookAddr+10 is
+	// original code, NOT stolen — must not be re-executed here.)
+	uint8_t* tramp = page + 32;
+	size_t t = 0;
+	memcpy(tramp + t, hookAddr, 3); t += 3;                        // mov rbx, rax
+	tramp[t++] = 0x48; tramp[t++] = 0x8B; tramp[t++] = 0x05;       // mov rax, [rip+newdisp]
+	int64_t delta = (int64_t)absTarget - (int64_t)(tramp + t + 4);
+	if (delta > INT32_MAX || delta < INT32_MIN) {
+		printf("[KeyHook] trampoline disp32 out of range (%lld)\n", delta);
+		return false;
+	}
+	int32_t newDisp = (int32_t)delta;
+	memcpy(tramp + t, &newDisp, 4); t += 4;
+	tramp[t++] = 0xFF; tramp[t++] = 0x25; tramp[t++] = 0; tramp[t++] = 0; tramp[t++] = 0; tramp[t++] = 0;
+	uint64_t back = (uint64_t)(hookAddr + 10);
+	memcpy(tramp + t, &back, 8); t += 8;
+	FlushInstructionCache(GetCurrentProcess(), page, 0x1000);
+	gKeyTrampoline = (uint64_t)tramp;
+
+	// patch at hookAddr: E9 rel32 -> relay (5 bytes, register-free, stack-neutral)
+	// stolen region is only 10 bytes (mov rbx,rax + mov rax,[rip]) -> 5 NOPs
+	uint8_t patch[10];
+	int64_t rel = (int64_t)((uint64_t)relay) - (int64_t)(hookAddr + 5);
+	if (rel > INT32_MAX || rel < INT32_MIN) {
+		printf("[KeyHook] patch rel32 out of range (%lld)\n", rel);
+		return false;
+	}
+	patch[0] = 0xE9;
+	int32_t rel32 = (int32_t)rel;
+	memcpy(patch + 1, &rel32, 4);
+	memset(patch + 5, 0x90, 5);
+
+	DWORD oldProt;
+	if (!VirtualProtect(hookAddr, sizeof(patch), PAGE_EXECUTE_READWRITE, &oldProt)) return false;
+	memcpy(hookAddr, patch, sizeof(patch));
+	FlushInstructionCache(GetCurrentProcess(), hookAddr, sizeof(patch));
+	VirtualProtect(hookAddr, sizeof(patch), oldProt, &oldProt);
+	return true;
+}
+
+// Masked pattern scan within one region. Returns first hit or NULL.
+static uint8_t* PatternScan(const uint8_t* start, size_t size,
+	const uint8_t* pat, const uint8_t* mask, size_t patLen)
+{
+	const uint8_t first = pat[0];
+	const uint8_t* end = start + size;
+	for (const uint8_t* p = start; p + patLen <= end; ++p) {
+		if (*p != first) continue;
+		const uint8_t* q = p;
+		for (size_t i = 1; i < patLen; ++i) {
+			if (mask[i] && q[i] != pat[i]) goto next;
+		}
+		return (uint8_t*)p;
+	next:;
+	}
+	return NULL;
+}
+
+struct Pat { uint8_t b[128]; uint8_t m[128]; size_t len; };
+
+static bool ParsePattern(const char* text, Pat& out) {
+	out.len = 0;
+	while (*text && out.len < 128) {
+		if (*text == ' ') { ++text; continue; }
+		if (text[0] == '?' && text[1] == '?') {
+			out.b[out.len] = 0; out.m[out.len] = 0; out.len++;
+			text += 2;
+		}
+		else {
+			int v;
+			if (sscanf_s(text, "%2x", &v) != 1) return false;
+			out.b[out.len] = (uint8_t)v; out.m[out.len] = 1; out.len++;
+			text += 2;
+		}
+	}
+	return out.len > 0;
+}
+
+static bool IsBlueArchiveHost() {
+	char path[MAX_PATH];
+	if (!GetModuleFileNameA(NULL, path, MAX_PATH)) return false;
+	const char* name = strrchr(path, '\\');
+	name = name ? name + 1 : path;
+	return _stricmp(name, "BlueArchive.exe") == 0;
+}
+
+DWORD WINAPI keyScanThread(LPVOID) {
+	if (!IsBlueArchiveHost()) return 0;
+	InitConsoleWindow(TRUE);
+	Pat pat;
+	if (!ParsePattern(KEY_AOB, pat)) {
+		printf("[KeyHook] bad AOB pattern\n");
+		return 0;
+	}
+	printf("[KeyHook] waiting for GameAssembly.dll...\n");
+	int notFoundRounds = 0;
+	for (;;) {
+		HMODULE hMod = GetModuleHandleA("GameAssembly.dll");
+		if (!hMod) { Sleep(1000); continue; }
+
+		// scan all executable sections of the module
+		uint8_t* base = (uint8_t*)hMod;
+		auto dos = (IMAGE_DOS_HEADER*)base;
+		auto nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+		auto sec = IMAGE_FIRST_SECTION(nt);
+		uint8_t* hit = NULL;
+		int hits = 0;
+		for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+			if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+			uint8_t* s = base + sec->VirtualAddress;
+			size_t sz = sec->Misc.VirtualSize;
+			uint8_t* h = PatternScan(s, sz, pat.b, pat.m, pat.len);
+			if (h) { ++hits; if (!hit) hit = h; }
+		}
+		if (hits == 1) {
+			uintptr_t rva = (uintptr_t)hit - (uintptr_t)base;
+			printf("[KeyHook] AOB unique hit: GameAssembly.dll+0x%llX (VA %p)\n",
+				(unsigned long long)rva, (void*)hit);
+			uint8_t* target = hit + KEY_HOOK_OFFSET;
+			if (InstallKeyHook(target))
+				printf("[KeyHook] hook installed at GameAssembly.dll+0x%llX, waiting for key...\n",
+					(unsigned long long)(rva + KEY_HOOK_OFFSET));
+			return 0;
+		}
+		if (hits > 1) {
+			printf("[KeyHook] WARNING: %d matches, pattern not unique, aborting\n", hits);
+			return 0;
+		}
+		if (++notFoundRounds > 10) {
+			printf("[KeyHook] module present but pattern not found after %d rounds, giving up\n", notFoundRounds);
+			return 0;
+		}
+		Sleep(1000);
+	}
+}
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
 	char path[MAX_PATH];
@@ -196,11 +465,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
 		GetSystemDirectoryA(path, MAX_PATH);
 		strcat_s(path, "\\winmm.dll");
 		hOrigDll = LoadLibraryA(path);
-		if (hOrigDll == NULL)
-		{
-			MessageBoxA(0, "Cannot load original winmm.dll library", "Proxy", MB_ICONERROR);
-			ExitProcess(0);
-		}else MessageBoxA(0, "Hook Begin!!!", "Proxy", MB_ICONINFORMATION);
+		CreateThread(NULL, 0, keyScanThread, NULL, 0, NULL);
 		OrignalCloseDriver = GetProcAddress(hOrigDll, "CloseDriver");
 		OrignalDefDriverProc = GetProcAddress(hOrigDll, "DefDriverProc");
 		OrignalDriverCallback = GetProcAddress(hOrigDll, "DriverCallback");
