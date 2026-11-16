@@ -249,9 +249,11 @@ static const char* KEY_AOB =
 // Plain C handler. The framework-built stub saved all GPRs into ctx before
 // calling us; ctx->Rax is the IL2CPP String at the hook point (mov rbx,rax
 // has not yet executed, RAX still holds the hex key string).
+// Captured key shared with patcherThread. Set once by keyHandler.
+static char g_keyHex[65] = { 0 };
+
 extern "C" void keyHandler(MF_CONTEXT* ctx) {
 	printf("[KeyHook] hook fired, RAX=%p\n", (void*)ctx->Rax);
-	MessageBoxA(NULL, "L", "LOG", MB_OK);
 	fflush(stdout);
 	__try {
 		uint8_t* s = (uint8_t*)ctx->Rax;
@@ -262,11 +264,19 @@ extern "C" void keyHandler(MF_CONTEXT* ctx) {
 		buf[len] = 0;
 		printf("[KeyHook] PRAGMA key = \"x'%ls'\";\n", buf);
 		fflush(stdout);
+		if (!g_keyHex[0]) {
+			size_t n = 0;
+			for (int32_t i = 0; i < len && n < 64; ++i) {
+				if (buf[i] >= L'0' && buf[i] <= L'9' || buf[i] >= L'a' && buf[i] <= L'f' || buf[i] >= L'A' && buf[i] <= L'F')
+					g_keyHex[n++] = (char)buf[i];
+			}
+			g_keyHex[n] = 0;
+		}
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) {
 		printf("[KeyHook] exception reading string at %p\n", (void*)ctx->Rax);
 	}
-	MessageBoxA(NULL, "OVER", "OVER", MB_OK);
+	// MessageBoxA(NULL, "OVER", "OVER", MB_OK);
 }
 
 static bool InstallKeyHook(uint8_t* hookAddr) {
@@ -335,8 +345,64 @@ static bool IsBlueArchiveHost() {
 	return _stricmp(name, "BlueArchive.exe") == 0;
 }
 
+// If .\BlueArchiveCnPatcher.exe sits next to the game exe, poll once per second
+// until the hook captured the key, then run:
+//   BlueArchiveCnPatcher.exe --db-password <key>
+DWORD WINAPI patcherThread(LPVOID) {
+	for (;;) {
+		if (g_keyHex[0]) {
+			char exeDir[MAX_PATH], patcher[MAX_PATH], params[96];
+			GetModuleFileNameA(NULL, exeDir, MAX_PATH);
+			char* slash = strrchr(exeDir, '\\');
+			if (slash) slash[1] = 0;  // keep only the directory part
+			sprintf_s(patcher, "%sBlueArchiveCnPatcher.exe", exeDir);
+			sprintf_s(params, "--db-password %s", g_keyHex);
+			// The patcher manifest requires admin: CreateProcess gives 740
+			// (ERROR_ELEVATION_REQUIRED). ShellExecuteEx with "runas" shows
+			// the normal UAC prompt instead. Falls back to plain "open".
+			SHELLEXECUTEINFOA sei = { sizeof(sei) };
+			sei.lpFile = patcher;
+			sei.lpParameters = params;
+			sei.lpDirectory = exeDir;
+			sei.nShow = SW_SHOWNORMAL;  // elevated console app gets its own visible console
+			sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+			sei.lpVerb = "runas";
+			if (!ShellExecuteExA(&sei)) {
+				printf("[Patcher] ShellExecuteEx runas failed (%lu), trying open\n", GetLastError());
+				sei.lpVerb = "open";
+				if (!ShellExecuteExA(&sei)) {
+					printf("[Patcher] ShellExecuteEx failed (%lu)\n", GetLastError());
+					fflush(stdout);
+					return 0;
+				}
+			}
+			printf("[Patcher] launched: %s %s\n", patcher, params);
+			if (sei.hProcess) {
+				WaitForSingleObject(sei.hProcess, INFINITE);
+				CloseHandle(sei.hProcess);
+			}
+			fflush(stdout);
+			return 0;
+		}
+		Sleep(1000);
+	}
+}
+
 DWORD WINAPI keyScanThread(LPVOID) {
 	if (!IsBlueArchiveHost()) return 0;
+	// Patcher companion: only if the CLI tool is present next to the game exe
+	{
+		char exeDir[MAX_PATH], patcher[MAX_PATH];
+		GetModuleFileNameA(NULL, exeDir, MAX_PATH);
+		char* slash = strrchr(exeDir, '\\');
+		if (slash) slash[1] = 0;
+		sprintf_s(patcher, "%sBlueArchiveCnPatcher.exe", exeDir);
+		if (GetFileAttributesA(patcher) != INVALID_FILE_ATTRIBUTES) {
+			printf("[Patcher] BlueArchiveCnPatcher.exe detected, starting key watcher\n");
+			CreateThread(NULL, 0, patcherThread, NULL, 0, NULL);
+		}
+		else return 0;
+	}
 	InitConsoleWindow(TRUE);
 	Pat pat;
 	if (!ParsePattern(KEY_AOB, pat)) {

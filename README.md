@@ -188,6 +188,18 @@ emit `lea r8, [rsp+0x60]` 时写了 `49 8D 44 24 60`。REX=0x49 的 **B 位=1 �
 
 CE 调试手段（ce-debug 技能）：卡进程后读 hook 点字节、relay/stub/trampoline 反汇编、断点读寄存器。本项目排障大量依赖此手段。
 
+### 5.1 BlueArchiveCnPatcher 自动联动（与 hook 本身无关的周边功能）
+
+`keyScanThread` 启动时若检测到游戏 exe 同目录存在 `BlueArchiveCnPatcher.exe`，
+则额外启动 `patcherThread`（每 1s 轮询）。keyHandler 首次捕获到密钥后存入
+`g_keyHex`，patcherThread 观察到即执行（CREATE_NO_WINDOW，工作目录=游戏目录）：
+
+```
+BlueArchiveCnPatcher.exe --db-password 05f508236ff3...
+```
+
+命令行与执行结果打印到控制台（`[Patcher]` 前缀）。无此 exe 时行为不变。
+
 ---
 
 ## 6. 迁移到其他游戏
